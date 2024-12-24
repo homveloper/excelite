@@ -7,110 +7,135 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/schollz/progressbar/v3"
-	"golang.org/x/sync/errgroup"
+	"excelite/exporter"
 )
 
-// go run main.go -inputdir=../../Content/Data -output=./generated
+// go run main.go -inputdir=./data -output=./generated -lang="go,nodejs" -package=models
+// go run main.go -inputfiles=game_data.xlsx -output=./generated -lang="all" -package=models
 func main() {
 	// CLI 플래그 정의
 	inputDir := flag.String("inputdir", "", "Directory containing Excel files")
 	inputFiles := flag.String("inputfiles", "", "Comma-separated list of Excel files")
 	outputDir := flag.String("output", "generated", "Output directory for generated files")
-	workers := flag.Int("workers", 4, "Number of parallel workers")
+	languages := flag.String("lang", "all", "Comma-separated list of target languages (go,cpp,nodejs,all)")
+	packageName := flag.String("package", "models", "Package name for generated code")
 	flag.Parse()
 
 	if *inputDir == "" && *inputFiles == "" {
-		log.Fatal("Please provide either -input-dir or -input-files flag")
-	}
-
-	// 생성기 초기화
-
-	gen := NewGenerator(*outputDir)
-
-	if err := gen.PrepareOutputDir(); err != nil {
-		log.Fatal(err)
+		log.Fatal("Either -inputdir or -inputfiles must be provided")
 	}
 
 	printBanner()
 
-	// 파일 목록 수집
+	// Excel 파일 목록 수집
 	var excelFiles []string
 	if *inputDir != "" {
 		files, err := collectExcelFiles(*inputDir)
 		if err != nil {
-			log.Fatal(err)
+			log.Fatalf("Failed to collect Excel files: %v", err)
 		}
 		excelFiles = files
 	} else {
 		excelFiles = strings.Split(*inputFiles, ",")
 	}
 
-	// 진행바 초기화
-	bar := progressbar.Default(int64(len(excelFiles)))
-
-	// 병렬 처리를 위한 error group 생성
-	g := new(errgroup.Group)
-	fileChan := make(chan string)
-
-	// 워커 생성
-	for i := 0; i < *workers; i++ {
-		workerID := i
-		g.Go(func() error {
-			return gen.Worker(workerID, fileChan, bar)
-		})
-	}
-
-	// 파일들을 채널에 전송
-	go func() {
-		for _, file := range excelFiles {
-			fileChan <- file
+	// Excel 파일들을 파싱하여 테이블 정의 수집
+	var allTables []exporter.Table
+	for _, file := range excelFiles {
+		tables, err := exporter.ParseExcelFile(file)
+		if err != nil {
+			log.Printf("Warning: Failed to parse %s: %v", file, err)
+			continue
 		}
-		close(fileChan)
-	}()
-
-	// 모든 워커가 완료될 때까지 대기
-	if err := g.Wait(); err != nil {
-		log.Fatal(err)
+		allTables = append(allTables, tables...)
 	}
 
-	// 출력 디렉토리 생성
-	if err := os.MkdirAll(*outputDir, 0755); err != nil {
-		log.Fatal(err)
+	// Registry에 exporter들 등록
+	registry := exporter.NewRegistry()
+
+	// Go exporter 등록
+	// registry.Register("go", exporter.NewGORMExporter, exporter.Options{
+	// 	PackageName: *packageName,
+	// 	ExtraOptions: map[string]interface{}{
+	// 		"useGorm":      true,
+	// 		"useSQLite":    true,
+	// 		"generateRepo": true,
+	// 	},
+	// })
+
+	// sqlite exporter 등록
+	registry.Register("sqlite", exporter.NewSQLiteExporter, exporter.Options{
+		PackageName: *packageName,
+	})
+
+	// // Node.js exporter 등록
+	// registry.Register("nodejs", exporter.NewNodeJSExporter, exporter.Options{
+	// 	PackageName: *packageName,
+	// 	ExtraOptions: map[string]interface{}{
+	// 		"useTypeScript": true,
+	// 		"useTypeORM":    true,
+	// 	},
+	// })
+
+	// 요청된 언어들로 export
+	requestedLangs := []string{}
+	if *languages == "all" {
+		requestedLangs = registry.Languages()
+	} else {
+		requestedLangs = strings.Split(*languages, ",")
 	}
 
-	// 파일 생성
-	if err := gen.GenerateFiles(); err != nil {
-		log.Fatal(err)
-	}
+	// 각 언어별로 Export 실행
+	for _, lang := range requestedLangs {
+		opts := exporter.Options{
+			OutputDir:   filepath.Join(*outputDir, lang),
+			PackageName: *packageName,
+			DBDriver:    "sqlite",
+			DBName:      "app.db",
+		}
 
-	log.Println("\nGeneration completed successfully! 🚀")
+		if err := registry.Export(lang, allTables, opts); err != nil {
+			log.Printf("Failed to export %s code: %v", lang, err)
+			continue
+		}
+		log.Printf("Successfully exported %s code", lang)
+	}
 }
 
-func printBanner() {
-	banner := `
-	███████╗██╗  ██╗ ██████╗███████╗██╗     ██╗████████╗███████╗
-    ██╔════╝╚██╗██╔╝██╔════╝██╔════╝██║     ██║╚══██╔══╝██╔════╝
-    █████╗   ╚███╔╝ ██║     █████╗  ██║     ██║   ██║   █████╗  
-    ██╔══╝   ██╔██╗ ██║     ██╔══╝  ██║     ██║   ██║   ██╔══╝  
-    ███████╗██╔╝ ██╗╚██████╗███████╗███████╗██║   ██║   ███████╗
-    ╚══════╝╚═╝  ╚═╝ ╚═════╝╚══════╝╚══════╝╚═╝   ╚═╝   ╚══════╝
-                                                      v0.0.1
-    Excel to Code & DB Generator
-    `
-	log.Println(banner)
-}
-
+// Excel 파일 수집 함수
 func collectExcelFiles(dir string) ([]string, error) {
 	var files []string
+
 	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
-		if !info.IsDir() && (strings.HasSuffix(info.Name(), ".xlsx") || strings.HasSuffix(info.Name(), ".xls")) {
-			files = append(files, path)
+		if !info.IsDir() {
+			// Excel 파일 확장자 확인 (.xlsx, .xls)
+			ext := strings.ToLower(filepath.Ext(path))
+			if ext == ".xlsx" || ext == ".xls" {
+				// 임시 파일 제외 (~$로 시작하는 파일)
+				if !strings.HasPrefix(filepath.Base(path), "~$") {
+					files = append(files, path)
+				}
+			}
 		}
 		return nil
 	})
+
 	return files, err
+}
+
+func printBanner() {
+	banner := `
+███████╗██╗  ██╗ ██████╗███████╗██╗     ██╗████████╗███████╗
+██╔════╝╚██╗██╔╝██╔════╝██╔════╝██║     ██║╚══██╔══╝██╔════╝
+█████╗   ╚███╔╝ ██║     █████╗  ██║     ██║   ██║   █████╗  
+██╔══╝   ██╔██╗ ██║     ██╔══╝  ██║     ██║   ██║   ██╔══╝  
+███████╗██╔╝ ██╗╚██████╗███████╗███████╗██║   ██║   ███████╗
+╚══════╝╚═╝  ╚═╝ ╚═════╝╚══════╝╚══════╝╚═╝   ╚═╝   ╚══════╝
+                                                  v0.0.1
+Excel to Code & DB Generator
+    `
+	log.Println(banner)
 }
